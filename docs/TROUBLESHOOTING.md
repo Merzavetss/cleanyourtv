@@ -1596,6 +1596,81 @@ So on this set only the focused window can answer the button, and only while Hom
 keycode first (`tools/tv.py 'logcat -d -v time | grep interceptKeyTq'` right after pressing the button),
 because `getevent -lt` did not show it in the captures taken here.
 
+## The Netflix button kills the picture settings until a reboot (KIVI, MediaTek)
+
+**Seen on:** a KIVI 65U710KB (`MTCMSD6886EU_KIVI`, device `bangbae`, MediaTek `m7322`), Android TV 11,
+build `RTO8.260427.001`, with `com.netflix.ninja` disabled by the debloat. Device note:
+[KIVI 65U710KB](devices/kivi-65u710kb.md).
+
+Contrast, brightness, saturation and backlight sliders save their value - `settings get global
+picture_contrast` answers the new number - and the panel does not change. The settings app only writes
+`Settings.Global`; the service that carries those keys to the TV chip,
+`com.mediatek.tv.service/com.mediatek.tv.agent.TVMenuSettingsService`, was dead, and `system_server` had
+stopped trying to restart it:
+
+```text
+* ServiceRecord{ccf3f5d ... TVMenuSettingsService}
+    app=null   startRequested=false   crashCount=1
+
+2026-11-15 17:33:29 system_server_wtf
+android.util.Log$TerribleFailure: Restarting service that is not needed:
+  ServiceRecord{ccf3f5d u0 com.mediatek.tv.service/com.mediatek.tv.agent.TVMenuSettingsService}
+    at com.android.server.am.ActiveServices.performServiceRestartLocked
+```
+
+The dropbox has the crash from the same second, and the trigger was the remote:
+
+```text
+2026-11-15 17:33:29 system_app_crash
+Process: com.mediatek.tv.service (PID 3548, UID 1000)
+java.lang.RuntimeException: Unable to start receiver com.mstar.netflixobserver.NetflixKeyReceiver:
+  android.content.ActivityNotFoundException: No Activity found to handle
+  Intent { act=com.netflix.action.NETFLIX_KEY_START flg=0x10020000 pkg=com.netflix.ninja }
+    at com.mstar.netflixobserver.NetflixObserver.resumeNetflix(NetflixObserver.java:285)
+    at com.mstar.netflixobserver.NetflixKeyReceiver.onReceive(NetflixKeyReceiver.java:128)
+```
+
+Here the Netflix button is `KEYCODE_MTKIR_NETFLIX` (265) in `/system/usr/keylayout/ttxkeymap.ini`,
+which the vendor layer turns into an `android.intent.action.GLOBAL_BUTTON` broadcast.
+`NetflixKeyReceiver` is a receiver inside `com.mediatek.tv.service`, running as uid 1000, and it answers
+with `startActivity` for `com.netflix.action.NETFLIX_KEY_START` on `com.netflix.ninja`, with no
+`try`/`catch` of its own. With the app disabled nothing resolves, the exception leaves `onReceive`, and
+the framework kills the process the receiver was registered in - the whole TV service. Live TV and HDMI
+are started again; `TVMenuSettingsService` is not, which is why only a reboot brings the sliders back,
+with the values already saved. Read that before chasing a picture problem:
+
+```sh
+tools/tv.py 'dumpsys activity services com.mediatek.tv.service | grep -A 6 TVMenuSettingsService'
+```
+
+`app=null` is the broken state and `app=ProcessRecord{.../1000}` a working one.
+
+Nothing on this build disarms the button, which is the part worth knowing:
+
+- `pm disable-user --user 0 com.mediatek.tv.service/com.mstar.netflixobserver.NetflixKeyReceiver` is
+  refused for the shell (`Shell cannot change component state`), and `adb root` answers `adbd cannot
+  run as root in production builds`. The package cannot go as a whole either: it is the tuner, the
+  inputs and Live TV.
+- The vendor hotkey dispatcher (`com.mediatek.hotkey.dispatcher`) reads `/vendor/etc/hot-key-info.ini`,
+  which maps only Amazon, Google Play and the IR assist key; `/vendor` is mounted `ro`, and
+  `/data/system/devices/keylayout` does not exist.
+- `resumeNetflix` returns early while `vendor.mtk.3rd.flag` is `"1"`, but that flag is read by
+  `MtcLiveTVSetupWizard`, `LiveTV`, `TvSettingsPlus` and `MtcFactoryCommandService` as well: it means
+  "firmware update in progress" for the whole TV, not a switch for this key.
+
+So either leave the button alone and reboot if it is pressed, or `pm enable --user 0 com.netflix.ninja`:
+`.MainActivity` declares `com.netflix.action.NETFLIX_KEY_START`, the intent resolves and the receiver
+cannot throw - at the cost of the button opening Netflix. `pm disable-user --user 0 com.netflix.ninja`
+undoes it.
+
+Two neighbouring reports with a different mechanism: on the TCL UnionTV above, Netflix's own receiver
+starts the app before any window sees the key, and on the Coocaa Y74 Pro the app buttons kill the
+vendor's key service because a provider launcherx owns is gone - see
+[the app-buttons entry][app-buttons]. What all three share is that the key is handled above the apps,
+so disabling an app does not disarm it.
+
+[app-buttons]: #app-buttons-crash-the-tvs-own-key-service-on-a-set-with-a-second-user-skyworthcoocaa
+
 ## The TV button does nothing and no app ever sees the key (TCL Google TV)
 
 **Seen on:** a TCL 55Q7D Pro (model "Smart TV Pro", `G08_4K_GB`, Google TV 14, firmware
